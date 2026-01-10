@@ -1,0 +1,23 @@
+{
+  "name": "boardvision-web",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "frontend",
+    "backend",
+    "mcp-mock"
+  ],
+  "scripts": {
+    "dev": "concurrently -n MCP,API,WEB -c magenta,cyan,green \"npm:dev:mcp\" \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:web": "npm -w frontend run dev",
+    "dev:api": "npm -w backend run dev",
+    "dev:mcp": "npm -w mcp-mock run dev",
+    "build": "npm -w frontend run build",
+    "lint": "npm -w frontend run lint"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
+
+

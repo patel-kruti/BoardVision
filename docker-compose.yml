@@ -1,0 +1,42 @@
+services:
+  mcp-mock:
+    build:
+      context: .
+      dockerfile: mcp-mock/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      # Optional: point the mock server at the real Python MCP (FastAPI) if you run it.
+      # Example: REAL_MCP_URL=http://host.docker.internal:8000
+      - REAL_MCP_URL=
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - MCP_URL=http://mcp-mock:8080
+    depends_on:
+      - mcp-mock
+    volumes:
+      - backend_outputs:/app/outputs
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_PORT=5173
+    depends_on:
+      - backend
+
+volumes:
+  backend_outputs:
+
+
