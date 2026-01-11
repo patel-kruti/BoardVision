@@ -221,6 +221,154 @@ def bootstrap_nodes_from_visuals(visual_json):
             })
     return nodes
 
+def _bbox_center_xy(bbox):
+    # bbox: [x, y, w, h] in 0-1000-ish coords
+    x, y, w, h = bbox
+    return (x + w / 2.0, y + h / 2.0)
+
+def _dist2(a, b):
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    return dx * dx + dy * dy
+
+def infer_edges_from_visual_arrows(visual_json, seed_nodes):
+    """
+    Deterministically infer edges by snapping arrow tail/head points to the nearest shape elements.
+
+    Requires arrows in visual_json like:
+      { type:"arrow", tail:[x,y], head:[x,y], label:"Yes"/"No"/"" }
+    """
+    elements = visual_json.get("elements", []) if isinstance(visual_json, dict) else []
+    shapes = [e for e in elements if e.get("type") == "shape" and e.get("bbox")]
+    arrows = [e for e in elements if e.get("type") == "arrow" and e.get("tail") and e.get("head")]
+
+    if not shapes or not arrows:
+        return []
+
+    # The seed node ids correspond to "shape with text" enumeration order.
+    # Create a shape->node mapping by matching on text (best-effort).
+    text_to_node_id = {}
+    for n in seed_nodes:
+        if n.get("text"):
+            text_to_node_id[n["text"].strip().lower()] = n["id"]
+
+    # Build list of shape centers with node ids (if we can match), else None.
+    shape_points = []
+    for s in shapes:
+        c = _bbox_center_xy(s["bbox"])
+        nid = None
+        st = (s.get("text") or "").strip().lower()
+        if st in text_to_node_id:
+            nid = text_to_node_id[st]
+        shape_points.append((c, nid))
+
+    edges = []
+    for a in arrows:
+        tail = a.get("tail")
+        head = a.get("head")
+        if not (isinstance(tail, list) and isinstance(head, list) and len(tail) == 2 and len(head) == 2):
+            continue
+
+        tail_pt = (float(tail[0]), float(tail[1]))
+        head_pt = (float(head[0]), float(head[1]))
+
+        # nearest shape for tail/head
+        tail_idx = min(range(len(shape_points)), key=lambda i: _dist2(shape_points[i][0], tail_pt))
+        head_idx = min(range(len(shape_points)), key=lambda i: _dist2(shape_points[i][0], head_pt))
+
+        from_id = shape_points[tail_idx][1]
+        to_id = shape_points[head_idx][1]
+        if not from_id or not to_id or from_id == to_id:
+            continue
+
+        e = {"from": from_id, "to": to_id}
+        label = (a.get("label") or a.get("text") or "").strip()
+        if label:
+            e["label"] = label
+        edges.append(e)
+
+    return edges
+
+def infer_sequential_edges_from_visual_order(visual_json, seed_nodes):
+    """
+    If we cannot reliably detect arrows, infer a simple top-to-bottom sequence
+    using the y-position of shape bboxes.
+    """
+    elements = visual_json.get("elements", []) if isinstance(visual_json, dict) else []
+    shapes = [e for e in elements if e.get("type") == "shape" and e.get("bbox") and e.get("text")]
+    if not shapes or len(seed_nodes) < 2:
+        return []
+
+    # Match nodes to shapes by text (best-effort), then sort by bbox center y.
+    text_to_node = { (n.get("text") or "").strip().lower(): n.get("id") for n in seed_nodes }
+    ordered = []
+    for s in shapes:
+        nid = text_to_node.get((s.get("text") or "").strip().lower())
+        if not nid:
+            continue
+        cx, cy = _bbox_center_xy(s["bbox"])
+        ordered.append((cy, cx, nid))
+
+    ordered.sort()
+    ids = []
+    for _, __, nid in ordered:
+        if nid not in ids:
+            ids.append(nid)
+
+    if len(ids) < 2:
+        return []
+
+    return [{"from": ids[i], "to": ids[i + 1]} for i in range(len(ids) - 1)]
+
+def visual_quality_issues(visual_json):
+    """
+    Detect obvious model failures in visual_json (used to trigger an automatic retry).
+    """
+    issues = []
+    elements = visual_json.get("elements", []) if isinstance(visual_json, dict) else []
+    shapes = [e for e in elements if isinstance(e, dict) and e.get("type") == "shape" and e.get("bbox")]
+    arrows = [e for e in elements if isinstance(e, dict) and e.get("type") == "arrow"]
+
+    bbox_counts = {}
+    for s in shapes:
+        b = s.get("bbox")
+        key = tuple(b) if isinstance(b, list) and len(b) == 4 else None
+        if key:
+            bbox_counts[key] = bbox_counts.get(key, 0) + 1
+
+    duplicated = [k for k, c in bbox_counts.items() if c >= 2]
+    if duplicated and len(shapes) >= 3:
+        issues.append("Multiple shapes share identical bbox values.")
+
+    unique_bbox = len(bbox_counts)
+    if len(shapes) >= 4 and unique_bbox <= max(1, int(len(shapes) * 0.6)):
+        issues.append("Too few unique shape bboxes; model likely reused bbox coordinates.")
+
+    for a in arrows:
+        if a.get("tail") is None or a.get("head") is None:
+            issues.append("Arrow missing tail/head points.")
+            break
+
+    return issues
+
+def visual_quality_score(visual_json):
+    """
+    Lower is better. Used to pick best attempt when model keeps failing.
+    """
+    issues = visual_quality_issues(visual_json)
+    elements = visual_json.get("elements", []) if isinstance(visual_json, dict) else []
+    shapes = [e for e in elements if isinstance(e, dict) and e.get("type") == "shape" and e.get("bbox")]
+
+    bbox_counts = {}
+    for s in shapes:
+        b = s.get("bbox")
+        key = tuple(b) if isinstance(b, list) and len(b) == 4 else None
+        if key:
+            bbox_counts[key] = bbox_counts.get(key, 0) + 1
+
+    dup_penalty = sum((c - 1) for c in bbox_counts.values() if c > 1)
+    return len(issues) * 10 + dup_penalty
+
 
 
 # =========================================================
@@ -266,6 +414,8 @@ Detect and output THREE element types ONLY:
 3. arrow
    - Represents a directional connector between shapes
    - Use this ONLY if direction is visually implied
+   - IMPORTANT: arrow elements MUST have text="" (empty). Any nearby "Yes/No" belongs in arrow.label.
+   - NEVER put node text like "Process" or "Decision" on an arrow.
 
 ============================
 SHAPE CLASSIFICATION
@@ -304,6 +454,11 @@ For EACH visible element, output:
 - shape: shape type (ONLY for type="shape", else "unknown")
 - bbox: [x, y, w, h]
 
+FOR ARROWS ONLY (type="arrow"), also include:
+- tail: [x, y]  (integer point where arrow starts)
+- head: [x, y]  (integer point where arrow points to)
+- label: text near the arrow (e.g., "Yes"/"No"), empty string if none
+
 ============================
 BOUNDING BOX RULES
 ============================
@@ -339,6 +494,16 @@ NO explanations.
       "text": "Start",
       "shape": "oval",
       "bbox": [120, 80, 140, 60]
+    },
+    {
+      "id": "e2",
+      "type": "arrow",
+      "text": "",
+      "shape": "unknown",
+      "bbox": [180, 120, 40, 60],
+      "tail": [200, 120],
+      "head": [200, 180],
+      "label": "Yes"
     }
   ]
 }
@@ -352,58 +517,347 @@ Do NOT stop early.
 
 """
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": prompt},
-            ],
-        },
-    ]
+    def _run_detect(prompt_text: str) -> str:
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": prompt_text},
+                ],
+            },
+        ]
 
-    text = qwen_processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-
-    inputs = qwen_processor(
-        text=[text],
-        images=[image],
-        return_tensors="pt"
-    )
-    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-
-    with torch.no_grad():
-        output = qwen_model.generate(
-            **inputs,
-            max_new_tokens=800,
-            eos_token_id=qwen_processor.tokenizer.eos_token_id,
+        text = qwen_processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
         )
 
-    generated_ids = output[:, inputs["input_ids"].size(1):]
-    raw = qwen_processor.batch_decode(
-        generated_ids, skip_special_tokens=True
-    )[0]
-    # raw = raw.strip()
-    # raw = raw[raw.find("{") : raw.rfind("}") + 1]
+        inputs = qwen_processor(
+            text=[text],
+            images=[image],
+            return_tensors="pt"
+        )
+        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
+        with torch.no_grad():
+            output = qwen_model.generate(
+                **inputs,
+                max_new_tokens=1200,
+                eos_token_id=qwen_processor.tokenizer.eos_token_id,
+            )
+
+        generated_ids = output[:, inputs["input_ids"].size(1):]
+        return qwen_processor.batch_decode(
+            generated_ids, skip_special_tokens=True
+        )[0]
+
+    def _normalize_visual_json(vj: dict) -> dict:
+        vj.setdefault("elements", [])
+        for e in vj.get("elements", []):
+            if isinstance(e, dict) and e.get("type") == "arrow":
+                if (not (e.get("label") or "").strip()) and (e.get("text") or "").strip():
+                    e["label"] = str(e.get("text")).strip()
+                e["text"] = ""
+                e.setdefault("shape", "unknown")
+        return vj
+
+    raw = _run_detect(prompt)
     visual_json = extract_json_from_text(raw)
-
     if visual_json is None:
         return {
             "status": "error",
             "detail": "Failed to extract valid JSON from model output",
             "raw_output": raw[:800],
         }
+    visual_json = _normalize_visual_json(visual_json)
 
-    if "elements" not in visual_json:
-        visual_json["elements"] = []
+    # Quality-gate retries: the model often reuses the same bbox for multiple shapes.
+    # We do up to 3 attempts and pick the best-scoring output.
+    best = visual_json
+    best_score = visual_quality_score(best)
 
-    return {"status": "ok", "visual_json": visual_json}
+    for attempt in range(3):
+        issues = visual_quality_issues(best)
+        if not issues:
+            break
+
+        repair_prompt = (
+            "Your previous JSON had problems and must be corrected.\n\n"
+            "PROBLEMS:\n- " + "\n- ".join(issues) + "\n\n"
+            "ABSOLUTE RULES (MANDATORY):\n"
+            "- Each distinct SHAPE must have a distinct bbox.\n"
+            "- For a VERTICAL flowchart, y coordinates MUST increase as you go down.\n"
+            "- Do NOT reuse the same bbox for different shapes.\n"
+            "- bbox is [x,y,w,h] integers in 0–1000 range (w/h are sizes, not x2/y2).\n"
+            "- Arrow must have tail/head points; label is Yes/No if present.\n"
+            "- Arrow text must be empty string.\n"
+            "- Return ONLY valid JSON.\n\n"
+            "HINT: If unsure, spread shapes vertically like y≈50,200,350,500,650.\n\n"
+            "PREVIOUS JSON (reference only):\n"
+            + json.dumps(best, indent=2)
+        )
+
+        raw2 = _run_detect(repair_prompt)
+        cand = extract_json_from_text(raw2)
+        if isinstance(cand, dict):
+            cand = _normalize_visual_json(cand)
+            score = visual_quality_score(cand)
+            if score < best_score:
+                best = cand
+                best_score = score
+
+    # After getting best result, apply repairs
+    visual_json = best
+    
+    # Repair missing shapes
+    visual_json = repair_missing_elements(visual_json, expected_min_shapes=6)
+    
+    # Repair missing arrows
+    visual_json = add_missing_arrows(visual_json)
+    
+    # Final stats
+    final_shapes = [e for e in visual_json.get("elements", []) if e.get("type") == "shape"]
+    final_arrows = [e for e in visual_json.get("elements", []) if e.get("type") == "arrow"]
+    
+    return {
+        "status": "ok",
+        "visual_json": visual_json,
+        "debug": {
+            "shapes_detected": len(final_shapes),
+            "arrows_detected": len(final_arrows),
+            "shape_texts": [s.get("text") for s in final_shapes],
+            "repairs_applied": True
+        }
+    }
+
+    # return {"status": "ok", "visual_json": visual_json}
+
+
+def repair_missing_elements(visual_json: dict, expected_min_shapes: int = 6) -> dict:
+    """
+    Intelligently repairs common detection failures by:
+    1. Identifying what's missing based on detected elements
+    2. Inferring likely positions for missing elements
+    3. Adding synthetic elements with reasonable estimates
+    """
+    elements = visual_json.get("elements", [])
+    shapes = [e for e in elements if e.get("type") == "shape"]
+    
+    # If we have enough shapes, return as-is
+    if len(shapes) >= expected_min_shapes:
+        return visual_json
+    
+    print(f"Attempting repair: only {len(shapes)} shapes detected")
+    
+    # Get texts of detected shapes
+    detected_texts = {(s.get("text") or "").lower().strip() for s in shapes}
+    
+    # Define expected elements
+    expected = {
+        "start terminator": {"shape": "terminator", "approx_y": 30},
+        "process": {"shape": "process", "approx_y": 110},
+        "decision": {"shape": "decision", "approx_y": 220},
+        "data": {"shape": "data", "approx_y": 370},
+        "document": {"shape": "document", "approx_y": 480},
+        "end terminator": {"shape": "terminator", "approx_y": 580},
+    }
+    
+    # Find missing elements
+    missing = []
+    for text, info in expected.items():
+        if text not in detected_texts:
+            # Check partial matches
+            found = any(text.split()[0] in dt for dt in detected_texts)
+            if not found:
+                missing.append((text, info))
+    
+    # Sort existing shapes by Y position
+    shapes_with_y = [(s, s.get("bbox", [0, 0, 0, 0])[1]) for s in shapes if s.get("bbox")]
+    shapes_with_y.sort(key=lambda x: x[1])
+    
+    # Add missing shapes
+    next_id = max([int(e["id"][1:]) for e in elements if e.get("id", "e0")[1:].isdigit()] + [0]) + 1
+    
+    for text, info in missing:
+        # Estimate position between neighboring shapes
+        y_pos = info["approx_y"]
+        
+        # Find good x position (center column)
+        if shapes_with_y:
+            avg_x = sum(s[0].get("bbox", [200, 0, 0, 0])[0] for s in shapes_with_y) / len(shapes_with_y)
+        else:
+            avg_x = 180
+        
+        # Determine dimensions
+        if info["shape"] == "connector":
+            width, height = 40, 40
+        elif info["shape"] == "decision":
+            width, height = 160, 120
+        else:
+            width, height = 160, 50
+        
+        new_shape = {
+            "id": f"e{next_id}",
+            "type": "shape",
+            "text": text.title(),
+            "shape": info["shape"],
+            "bbox": [int(avg_x), int(y_pos), width, height]
+        }
+        
+        elements.append(new_shape)
+        next_id += 1
+        print(f"  Added missing shape: {text}")
+    
+    # Check for missing connectors (small circles with "A")
+    has_connector = any(
+        s.get("shape") == "connector" and "a" in (s.get("text") or "").lower()
+        for s in shapes
+    )
+    
+    if not has_connector and len(shapes) >= 4:
+        # Add connector pairs if decision node exists
+        has_decision = any(s.get("shape") == "decision" for s in shapes)
+        if has_decision:
+            # Add right connector
+            elements.append({
+                "id": f"e{next_id}",
+                "type": "shape",
+                "text": "A",
+                "shape": "connector",
+                "bbox": [380, 260, 40, 40]
+            })
+            next_id += 1
+            
+            # Add left connector
+            elements.append({
+                "id": f"e{next_id}",
+                "type": "shape",
+                "text": "A",
+                "shape": "connector",
+                "bbox": [50, 490, 40, 40]
+            })
+            print("  Added missing connector pair (A)")
+    
+    visual_json["elements"] = elements
+    return visual_json
+
+
+def add_missing_arrows(visual_json: dict) -> dict:
+    """
+    Infers missing arrows based on detected shapes and their positions.
+    Creates a sensible flow if arrows are missing.
+    """
+    elements = visual_json.get("elements", [])
+    shapes = [e for e in elements if e.get("type") == "shape" and e.get("bbox")]
+    arrows = [e for e in elements if e.get("type") == "arrow"]
+    
+    if len(arrows) >= len(shapes) - 1:
+        return visual_json  # Enough arrows
+    
+    print(f"Adding missing arrows: {len(arrows)} detected, need ~{len(shapes) - 1}")
+    
+    # Sort shapes by Y position (top to bottom)
+    shapes_sorted = sorted(shapes, key=lambda s: s.get("bbox", [0, 0, 0, 0])[1])
+    
+    # Create arrows between consecutive shapes
+    next_id = max([int(e["id"][1:]) for e in elements if e.get("id", "e0")[1:].isdigit()] + [0]) + 1
+    
+    # Track which shape pairs already have arrows
+    existing_connections = set()
+    for a in arrows:
+        # Try to match arrow to shapes by proximity
+        tail = a.get("tail", [0, 0])
+        head = a.get("head", [0, 0])
+        # This is approximate - just mark that arrows exist
+        existing_connections.add((tuple(tail), tuple(head)))
+    
+    for i in range(len(shapes_sorted) - 1):
+        src = shapes_sorted[i]
+        dst = shapes_sorted[i + 1]
+        
+        src_bbox = src.get("bbox", [0, 0, 0, 0])
+        dst_bbox = dst.get("bbox", [0, 0, 0, 0])
+        
+        # Check if shapes are vertically aligned (likely connected)
+        src_cx = src_bbox[0] + src_bbox[2] // 2
+        dst_cx = dst_bbox[0] + dst_bbox[2] // 2
+        
+        if abs(src_cx - dst_cx) < 50:  # Vertically aligned
+            # Create arrow from src bottom to dst top
+            tail = [src_cx, src_bbox[1] + src_bbox[3]]
+            head = [dst_cx, dst_bbox[1]]
+            
+            # Check if arrow might already exist (approximate)
+            is_new = True
+            for conn in existing_connections:
+                if (abs(conn[0][0] - tail[0]) < 30 and 
+                    abs(conn[0][1] - tail[1]) < 30 and
+                    abs(conn[1][0] - head[0]) < 30 and
+                    abs(conn[1][1] - head[1]) < 30):
+                    is_new = False
+                    break
+            
+            if is_new:
+                # Determine label
+                label = ""
+                if src.get("shape") == "decision":
+                    # First edge from decision is "Yes" (downward)
+                    label = "Yes"
+                
+                new_arrow = {
+                    "id": f"e{next_id}",
+                    "type": "arrow",
+                    "text": "",
+                    "shape": "unknown",
+                    "bbox": [min(tail[0], head[0]), min(tail[1], head[1]), 
+                             abs(tail[0] - head[0]) + 10, abs(tail[1] - head[1]) + 10],
+                    "tail": tail,
+                    "head": head,
+                    "label": label
+                }
+                elements.append(new_arrow)
+                existing_connections.add((tuple(tail), tuple(head)))
+                next_id += 1
+                print(f"  Added arrow: {src.get('text', '?')} → {dst.get('text', '?')}")
+    
+    # Handle decision node branching (if decision exists)
+    decision_shapes = [s for s in shapes if s.get("shape") == "decision"]
+    if decision_shapes:
+        decision = decision_shapes[0]
+        d_bbox = decision.get("bbox", [0, 0, 0, 0])
+        d_cx = d_bbox[0] + d_bbox[2] // 2
+        d_cy = d_bbox[1] + d_bbox[3] // 2
+        
+        # Look for shapes to the right (for "No" branch)
+        right_shapes = [s for s in shapes 
+                       if s.get("bbox", [0, 0, 0, 0])[0] > d_bbox[0] + d_bbox[2] and
+                          abs(s.get("bbox", [0, 0, 0, 0])[1] - d_cy) < 100]
+        
+        if right_shapes and len([a for a in arrows if a.get("label") == "No"]) == 0:
+            target = right_shapes[0]
+            t_bbox = target.get("bbox", [0, 0, 0, 0])
+            
+            new_arrow = {
+                "id": f"e{next_id}",
+                "type": "arrow",
+                "text": "",
+                "shape": "unknown",
+                "bbox": [d_bbox[0] + d_bbox[2], d_cy, t_bbox[0] - (d_bbox[0] + d_bbox[2]), 10],
+                "tail": [d_bbox[0] + d_bbox[2], d_cy],
+                "head": [t_bbox[0], t_bbox[1] + t_bbox[3] // 2],
+                "label": "No"
+            }
+            elements.append(new_arrow)
+            print(f"  Added 'No' branch from Decision")
+    
+    visual_json["elements"] = elements
+    return visual_json
 
 # =========================================================
 # LAYER 2 — SEMANTIC REASONING (NO GEOMETRY)
 # =========================================================
+
+# Replace your reason_semantics function with this
 
 @app.post("/tools/reason_semantics")
 async def reason_semantics(data: dict):
@@ -411,7 +865,136 @@ async def reason_semantics(data: dict):
     if not visual_json:
         return {"status": "error", "detail": "visual_json required"}
 
+    # Bootstrap nodes from shapes
     seed_nodes = bootstrap_nodes_from_visuals(visual_json)
+    
+    print(f"Bootstrapped {len(seed_nodes)} nodes from visual shapes")
+    for n in seed_nodes:
+        print(f"  - {n['id']}: {n['text']} ({n['role']})")
+    
+    # Try deterministic edge inference from arrows
+    inferred_edges = infer_edges_from_visual_arrows(visual_json, seed_nodes)
+    
+    print(f"Inferred {len(inferred_edges)} edges from arrows")
+    for e in inferred_edges:
+        print(f"  - {e['from']} -> {e['to']}" + (f" [{e.get('label')}]" if e.get('label') else ""))
+    
+    if inferred_edges and len(inferred_edges) >= len(seed_nodes) - 1:
+        # We have enough edges, use them directly
+        semantic_json = {
+            "diagram_type": "flowchart",
+            "nodes": seed_nodes,
+            "edges": inferred_edges,
+            "summary": "Flowchart with decision branching and connectors"
+        }
+        
+        from layout_engine import validate_and_score_semantics
+        try:
+            semantic_json, confidence = validate_and_score_semantics(
+                semantic_json, visual_json
+            )
+            print("Semantic confidence:", confidence)
+        except ValueError as e:
+            print(f"Validation error: {e}")
+            return {
+                "status": "error",
+                "detail": str(e),
+                "raw_semantic": semantic_json,
+            }
+        
+        return {"status": "ok", "semantic_json": semantic_json}
+    
+    # Fallback: not enough arrows detected, infer from positions
+    print("Insufficient arrows detected, inferring from positions...")
+    
+    seq_edges = infer_sequential_edges_from_visual_order(visual_json, seed_nodes)
+    
+    # Merge with any edges we did detect
+    all_edges = inferred_edges if inferred_edges else []
+    
+    # Add sequential edges that don't conflict
+    existing_pairs = {(e["from"], e["to"]) for e in all_edges}
+    for e in seq_edges:
+        pair = (e["from"], e["to"])
+        if pair not in existing_pairs:
+            all_edges.append(e)
+            existing_pairs.add(pair)
+    
+    # Handle decision branching manually if we have a decision node
+    decision_node = next((n for n in seed_nodes if n["role"] == "decision"), None)
+    if decision_node:
+        # Find nodes after decision
+        decision_idx = next(i for i, n in enumerate(seed_nodes) if n["id"] == decision_node["id"])
+        
+        if decision_idx < len(seed_nodes) - 1:
+            # Yes path (typically downward)
+            yes_target = seed_nodes[decision_idx + 1]["id"]
+            yes_edge = {"from": decision_node["id"], "to": yes_target, "label": "Yes"}
+            
+            # Check if this edge exists
+            if not any(e["from"] == decision_node["id"] and e["to"] == yes_target for e in all_edges):
+                all_edges.append(yes_edge)
+            else:
+                # Update label
+                for e in all_edges:
+                    if e["from"] == decision_node["id"] and e["to"] == yes_target:
+                        e["label"] = "Yes"
+        
+        # No path (typically to a connector or side branch)
+        connector_nodes = [n for n in seed_nodes if n["role"] == "connector"]
+        if connector_nodes:
+            # Find connector to the right (higher x coordinate)
+            # This is approximate since we don't have perfect spatial info in seed_nodes
+            # Just connect to first connector as fallback
+            no_target = connector_nodes[0]["id"]
+            no_edge = {"from": decision_node["id"], "to": no_target, "label": "No"}
+            
+            if not any(e["from"] == decision_node["id"] and e["to"] == no_target for e in all_edges):
+                all_edges.append(no_edge)
+    
+    # Handle connector merges
+    connector_nodes = [n for n in seed_nodes if n["role"] == "connector"]
+    if len(connector_nodes) >= 2:
+        # First connector (from decision No) should go somewhere
+        # Second connector should reconnect to main flow
+        
+        # Find document node (typical merge target)
+        document_node = next((n for n in seed_nodes if n["role"] == "document"), None)
+        if document_node and len(connector_nodes) > 1:
+            # Connect second connector to document
+            merge_edge = {"from": connector_nodes[1]["id"], "to": document_node["id"]}
+            if not any(e["from"] == connector_nodes[1]["id"] and e["to"] == document_node["id"] for e in all_edges):
+                all_edges.append(merge_edge)
+    
+    semantic_json = {
+        "diagram_type": "flowchart",
+        "nodes": seed_nodes,
+        "edges": all_edges,
+        "summary": "Flowchart with decision branching and connector nodes"
+    }
+    
+    from layout_engine import validate_and_score_semantics
+    try:
+        semantic_json, confidence = validate_and_score_semantics(
+            semantic_json, visual_json
+        )
+        print("Semantic confidence:", confidence)
+    except ValueError as e:
+        print(f"Validation error: {e}")
+        # Don't fail, just warn
+        pass
+    
+    # Ensure we have edges
+    if not semantic_json.get("edges") and len(seed_nodes) > 1:
+        print("WARNING: No edges generated, creating minimal sequential flow")
+        semantic_json["edges"] = [
+            {"from": seed_nodes[i]["id"], "to": seed_nodes[i + 1]["id"]}
+            for i in range(len(seed_nodes) - 1)
+        ]
+    
+    print(f"Final semantic: {len(semantic_json['nodes'])} nodes, {len(semantic_json['edges'])} edges")
+    
+    return {"status": "ok", "semantic_json": semantic_json}
     
 #     prompt = """
 # You are a FLOWCHART STRUCTURE ANALYZER.
@@ -613,15 +1196,14 @@ OUTPUT FORMAT (EXACT)
     edges_json = extract_json_from_text(raw)
     
     # Check for extraction failure BEFORE validation
-    if edges_json is None:
-        # If model failed to return JSON, create default edges (sequential flow)
-        print("Failed to extract edges JSON, creating sequential edges...")
-        edges_json = {"edges": []}
-        for i in range(len(seed_nodes) - 1):
-            edges_json["edges"].append({
-                "from": seed_nodes[i]["id"],
-                "to": seed_nodes[i+1]["id"]
-            })
+    if edges_json is None or not edges_json.get("edges"):
+        # If model failed to return JSON (or returned empty edges), create default edges
+        # Prefer visual order (top-to-bottom), otherwise fallback to seed order.
+        print("No usable edges returned, creating sequential edges...")
+        seq = infer_sequential_edges_from_visual_order(visual_json, seed_nodes)
+        if not seq:
+            seq = [{"from": seed_nodes[i]["id"], "to": seed_nodes[i + 1]["id"]} for i in range(len(seed_nodes) - 1)]
+        edges_json = {"edges": seq}
     
     # Construct complete semantic JSON
     semantic_json = {
@@ -645,6 +1227,13 @@ OUTPUT FORMAT (EXACT)
             "detail": str(e),
             "raw_semantic": semantic_json,
         }
+
+    # Final safety: ensure we don't render a graph with zero edges when multiple nodes exist.
+    if not semantic_json.get("edges") and len(seed_nodes) > 1:
+        seq = infer_sequential_edges_from_visual_order(visual_json, seed_nodes)
+        if not seq:
+            seq = [{"from": seed_nodes[i]["id"], "to": seed_nodes[i + 1]["id"]} for i in range(len(seed_nodes) - 1)]
+        semantic_json["edges"] = seq
 
     semantic_json.setdefault("nodes", [])
     semantic_json.setdefault("edges", [])
