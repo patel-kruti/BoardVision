@@ -178,16 +178,41 @@ def bootstrap_nodes_from_visuals(visual_json):
     nodes = []
     for idx, e in enumerate(visual_json["elements"]):
         if e["type"] == "shape" and e.get("text"):
+            # Accept BOTH:
+            # - flowchart symbol labels: terminator/process/decision/data/document/connector
+            # - geometry labels: oval/rectangle/diamond/parallelogram/circle
+            shape = (e.get("shape") or "").strip().lower()
+            text = (e.get("text") or "").strip()
+            text_l = text.lower()
+
             SHAPE_TO_ROLE = {
-                "terminator": "start",    # refined later
+                # flowchart symbol labels
+                "terminator": "start",  # may become "end" based on text
                 "process": "process",
                 "decision": "decision",
                 "data": "data",
                 "document": "document",
-                "connector": "connector"
+                "connector": "connector",
+
+                # geometry labels (common outputs from detect_visuals)
+                "oval": "start",          # may become "end" based on text
+                "rectangle": "process",
+                "diamond": "decision",
+                "parallelogram": "data",
+                "circle": "connector",
             }
 
-            role = SHAPE_TO_ROLE.get(e.get("shape"), "unknown")
+            role = SHAPE_TO_ROLE.get(shape, "unknown")
+
+            # Heuristics to refine ambiguous cases
+            if role == "start":
+                # If the text indicates end, treat it as end terminator
+                if "end" in text_l or "stop" in text_l or "finish" in text_l or "terminate" in text_l:
+                    role = "end"
+            if role == "process":
+                # If text suggests a document, prefer document
+                if "document" in text_l:
+                    role = "document"
 
             nodes.append({
                 "id": f"n{idx+1}",
