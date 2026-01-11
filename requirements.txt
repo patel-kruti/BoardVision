@@ -3,3 +3,7 @@ uvicorn
 pillow
 pytesseract
 python-pptx
+torch
+transformers
+accelerate
+
