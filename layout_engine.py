@@ -10,25 +10,25 @@ from collections import defaultdict
 SLIDE_WIDTH_IN = 10.0
 SLIDE_HEIGHT_IN = 7.5
 
-LEFT_MARGIN_IN = 0.8
-TOP_MARGIN_IN = 0.8
+LEFT_MARGIN_IN = 0.5
+TOP_MARGIN_IN = 0.5
 
-COL_SPACING_IN = 3.2
-ROW_SPACING_IN = 2.0
+COL_SPACING_IN = 2.2
+ROW_SPACING_IN = 1.4
 
 # =========================================================
 # Role-based sizes (presentation-first)
 # =========================================================
 
 ROLE_SIZES = {
-    "start": (2.2, 1.0),
-    "end": (2.2, 1.0),
-    "process": (3.2, 1.5),
-    "decision": (3.6, 2.0),
-    "data": (3.2, 1.5),
-    "document": (3.2, 1.5),
-    "connector": (0.5, 0.5),   # small jump connector (A, B, etc.)
-    "unknown": (2.5, 1.2),
+    "start": (1.5, 0.7),
+    "end": (1.5, 0.7),
+    "process": (1.8, 0.9),
+    "decision": (1.8, 1.2),
+    "data": (1.8, 0.9),
+    "document": (1.8, 0.9),
+    "connector": (0.4, 0.4),   # small jump connector (A, B, etc.)
+    "unknown": (1.6, 0.8),
 }
 
 # =========================================================
@@ -64,18 +64,52 @@ class LayoutEngine:
         start_nodes = self._find_start_nodes(nodes, incoming)
         paths = self._enumerate_paths(start_nodes, outgoing)
 
+        # Detect flow direction from visual bboxes
+        flow_direction = self._detect_flow_direction(nodes)
+        
         node_columns = self._compute_columns(paths, id_to_node)
         node_rows = self._compute_rows(paths)
 
         layout_nodes = self._assign_positions(
-            id_to_node, node_columns, node_rows
+            id_to_node, node_columns, node_rows, flow_direction
         )
 
         return {
             "nodes": layout_nodes,
             "edges": edges,
             "summary": semantic_json.get("summary", ""),
+            "flow_direction": flow_direction,
         }
+
+    # -----------------------------------------------------
+    # Flow direction detection
+    # -----------------------------------------------------
+
+    def _detect_flow_direction(self, nodes):
+        """
+        Detect if flowchart flows horizontally or vertically
+        based on visual bbox positions.
+        Returns: "horizontal" or "vertical"
+        """
+        if len(nodes) < 2:
+            return "vertical"  # default
+        
+        # Calculate spread in X vs Y from visual bboxes
+        bboxes = [n.get("_bbox") for n in nodes if n.get("_bbox")]
+        if not bboxes:
+            return "vertical"
+        
+        x_coords = [bbox[0] + bbox[2]/2 for bbox in bboxes]  # center X
+        y_coords = [bbox[1] + bbox[3]/2 for bbox in bboxes]  # center Y
+        
+        x_spread = max(x_coords) - min(x_coords)
+        y_spread = max(y_coords) - min(y_coords)
+        
+        # If X spread is significantly larger, it's horizontal
+        if x_spread > y_spread * 1.3:
+            return "horizontal"
+        else:
+            return "vertical"
 
     # -----------------------------------------------------
     # Graph utilities
@@ -176,8 +210,39 @@ class LayoutEngine:
     # Absolute position assignment
     # -----------------------------------------------------
 
-    def _assign_positions(self, id_to_node, cols, rows):
+    def _assign_positions(self, id_to_node, cols, rows, flow_direction="vertical"):
         layout_nodes = []
+        
+        # Adjust spacing based on flow direction and node count
+        num_nodes = len(id_to_node)
+        max_col = max(cols.values()) if cols else 0
+        max_row = max(rows.values()) if rows else 0
+        
+        # Calculate required space based on actual shape sizes
+        base_width, base_height = 1.8, 1.2  # max shape size
+        
+        if flow_direction == "horizontal":
+            # For horizontal flow: X is flow, Y is branching
+            required_width = (max_col + 1) * base_width
+            required_height = (max_row + 1) * base_height
+            
+            # Scale spacing to fit slide with padding
+            col_spacing = (SLIDE_WIDTH_IN - 2 * LEFT_MARGIN_IN) / max(max_col + 1, 1)
+            row_spacing = (SLIDE_HEIGHT_IN - 2 * TOP_MARGIN_IN) / max(max_row + 1, 1)
+            
+            # Ensure minimum spacing between nodes
+            col_spacing = max(col_spacing, base_width * 1.2)
+            row_spacing = max(row_spacing, base_height * 1.1)
+        else:
+            # For vertical flow: Y is flow, X is branching
+            required_width = (max_col + 1) * base_width
+            required_height = (max_row + 1) * base_height
+            
+            col_spacing = (SLIDE_WIDTH_IN - 2 * LEFT_MARGIN_IN) / max(max_col + 1, 1)
+            row_spacing = (SLIDE_HEIGHT_IN - 2 * TOP_MARGIN_IN) / max(max_row + 1, 1)
+            
+            col_spacing = max(col_spacing, base_width * 1.1)
+            row_spacing = max(row_spacing, base_height * 1.2)
 
         for nid, node in id_to_node.items():
             col = cols.get(nid, 0)
@@ -186,13 +251,28 @@ class LayoutEngine:
             width, height = ROLE_SIZES.get(
                 node["role"], ROLE_SIZES["unknown"]
             )
+            
+            # Dynamically scale down for dense flowcharts
+            if num_nodes > 8:
+                scale_factor = min(0.7, 8.0 / num_nodes)
+                width *= scale_factor
+                height *= scale_factor
+            elif num_nodes > 5:
+                width *= 0.85
+                height *= 0.85
 
-            x = LEFT_MARGIN_IN + col * COL_SPACING_IN
-            y = TOP_MARGIN_IN + row * ROW_SPACING_IN
+            if flow_direction == "horizontal":
+                # Horizontal: col drives X, row drives Y
+                x = LEFT_MARGIN_IN + col * col_spacing
+                y = TOP_MARGIN_IN + row * row_spacing
+            else:
+                # Vertical: col drives X, row drives Y
+                x = LEFT_MARGIN_IN + col * col_spacing
+                y = TOP_MARGIN_IN + row * row_spacing
 
-            # Keep within slide bounds (best-effort)
-            x = max(0.1, min(x, SLIDE_WIDTH_IN - width - 0.1))
-            y = max(0.1, min(y, SLIDE_HEIGHT_IN - height - 0.1))
+            # Keep within slide bounds (strict clipping)
+            x = max(0.2, min(x, SLIDE_WIDTH_IN - width - 0.2))
+            y = max(0.2, min(y, SLIDE_HEIGHT_IN - height - 0.2))
 
             layout_nodes.append({
                 "id": nid,

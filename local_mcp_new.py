@@ -7,7 +7,12 @@ import torch
 import re
 import os
 
-from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from transformers import AutoProcessor
+try:
+    from transformers import AutoModelForVision2Seq
+except Exception:  # pragma: no cover - compatibility fallback
+    AutoModelForVision2Seq = None
+    from transformers import Qwen2VLForConditionalGeneration
 from pptx import Presentation
 from pptx.util import Inches
 from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_CONNECTOR_TYPE
@@ -41,7 +46,7 @@ VERTICAL_CENTER_IN = 3.5
 # LOAD QWEN2-VL (STABLE MODE)
 # =========================================================
 
-QWEN_MODEL = "Qwen/Qwen2-VL-2B-Instruct"
+QWEN_MODEL = os.getenv("QWEN_MODEL", "Qwen/Qwen2-VL-7B-Instruct")
 
 os.environ["ACCELERATE_DISABLE_RICH"] = "1"
 
@@ -51,13 +56,22 @@ qwen_processor = AutoProcessor.from_pretrained(
     QWEN_MODEL, trust_remote_code=True
 )
 
-qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
-    QWEN_MODEL,
-    trust_remote_code=True,
-    dtype=torch.float16,
-    device_map="auto",
-    low_cpu_mem_usage=True
-)
+if AutoModelForVision2Seq is not None:
+    qwen_model = AutoModelForVision2Seq.from_pretrained(
+        QWEN_MODEL,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        low_cpu_mem_usage=True
+    )
+else:
+    qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
+        QWEN_MODEL,
+        trust_remote_code=True,
+        dtype=torch.float16,
+        device_map="auto",
+        low_cpu_mem_usage=True
+    )
 
 # Determine device for tensors (will use GPU if available, otherwise CPU)
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -152,6 +166,17 @@ def extract_json_from_text(text: str):
     # Last resort: return None to signal failure
     return None
 
+def _save_debug_json(run_id: str, kind: str, payload: dict):
+    if not run_id:
+        return None
+    outpath = WORKDIR / f"{kind}_{run_id}.json"
+    try:
+        outpath.write_text(json.dumps(payload, indent=2))
+        return str(outpath)
+    except Exception as exc:
+        print(f"Failed to write debug {kind} JSON: {exc}")
+        return None
+
 def validate_semantics(semantic_json):
     nodes = semantic_json.get("nodes", [])
     edges = semantic_json.get("edges", [])
@@ -177,7 +202,7 @@ def validate_semantics(semantic_json):
 def bootstrap_nodes_from_visuals(visual_json):
     nodes = []
     for idx, e in enumerate(visual_json["elements"]):
-        if e["type"] == "shape" and e.get("text"):
+        if e["type"] == "shape":
             # Accept BOTH:
             # - flowchart symbol labels: terminator/process/decision/data/document/connector
             # - geometry labels: oval/rectangle/diamond/parallelogram/circle
@@ -213,11 +238,16 @@ def bootstrap_nodes_from_visuals(visual_json):
                 # If text suggests a document, prefer document
                 if "document" in text_l:
                     role = "document"
+                # If text suggests data, prefer data
+                elif "data" in text_l:
+                    role = "data"
 
             nodes.append({
                 "id": f"n{idx+1}",
                 "role": role,
-                "text": e["text"]
+                "text": text,
+                "_visual_id": e.get("id"),
+                "_bbox": e.get("bbox"),
             })
     return nodes
 
@@ -245,8 +275,13 @@ def infer_edges_from_visual_arrows(visual_json, seed_nodes):
     if not shapes or not arrows:
         return []
 
-    # The seed node ids correspond to "shape with text" enumeration order.
-    # Create a shape->node mapping by matching on text (best-effort).
+    # Create a shape->node mapping by visual id first, then by text.
+    shape_id_to_node_id = {}
+    for n in seed_nodes:
+        if n.get("_visual_id"):
+            shape_id_to_node_id[n["_visual_id"]] = n["id"]
+
+    # Fallback mapping by text (best-effort).
     text_to_node_id = {}
     for n in seed_nodes:
         if n.get("text"):
@@ -256,13 +291,15 @@ def infer_edges_from_visual_arrows(visual_json, seed_nodes):
     shape_points = []
     for s in shapes:
         c = _bbox_center_xy(s["bbox"])
-        nid = None
-        st = (s.get("text") or "").strip().lower()
-        if st in text_to_node_id:
-            nid = text_to_node_id[st]
+        nid = shape_id_to_node_id.get(s.get("id"))
+        if not nid:
+            st = (s.get("text") or "").strip().lower()
+            if st in text_to_node_id:
+                nid = text_to_node_id[st]
         shape_points.append((c, nid))
 
     edges = []
+    edge_key_to_idx = {}
     for a in arrows:
         tail = a.get("tail")
         head = a.get("head")
@@ -283,8 +320,19 @@ def infer_edges_from_visual_arrows(visual_json, seed_nodes):
 
         e = {"from": from_id, "to": to_id}
         label = (a.get("label") or a.get("text") or "").strip()
+        key = (from_id, to_id)
+        if key in edge_key_to_idx:
+            idx = edge_key_to_idx[key]
+            if label:
+                existing_label = edges[idx].get("label", "").strip()
+                if not existing_label:
+                    edges[idx]["label"] = label
+                elif label != existing_label:
+                    edges[idx]["label"] = f"{existing_label}/{label}"
+            continue
         if label:
             e["label"] = label
+        edge_key_to_idx[key] = len(edges)
         edges.append(e)
 
     return edges
@@ -295,18 +343,28 @@ def infer_sequential_edges_from_visual_order(visual_json, seed_nodes):
     using the y-position of shape bboxes.
     """
     elements = visual_json.get("elements", []) if isinstance(visual_json, dict) else []
-    shapes = [e for e in elements if e.get("type") == "shape" and e.get("bbox") and e.get("text")]
+    shapes = [e for e in elements if e.get("type") == "shape" and e.get("bbox")]
     if not shapes or len(seed_nodes) < 2:
         return []
 
-    # Match nodes to shapes by text (best-effort), then sort by bbox center y.
-    text_to_node = { (n.get("text") or "").strip().lower(): n.get("id") for n in seed_nodes }
+    # Match nodes to shapes by visual id first, then by text, then sort by bbox center y.
+    shape_id_to_node = { n.get("_visual_id"): n.get("id") for n in seed_nodes if n.get("_visual_id") }
+    text_to_node = { (n.get("text") or "").strip().lower(): n.get("id") for n in seed_nodes if n.get("text") }
+    id_to_node = {n.get("id"): n for n in seed_nodes}
     ordered = []
     for s in shapes:
-        nid = text_to_node.get((s.get("text") or "").strip().lower())
+        nid = shape_id_to_node.get(s.get("id"))
+        if not nid:
+            nid = text_to_node.get((s.get("text") or "").strip().lower())
         if not nid:
             continue
         cx, cy = _bbox_center_xy(s["bbox"])
+        role = id_to_node.get(nid, {}).get("role", "unknown")
+        # Force start to the top and end to the bottom when bbox order is unreliable.
+        if role == "start":
+            cy = -10_000
+        elif role == "end":
+            cy = 10_000
         ordered.append((cy, cx, nid))
 
     ordered.sort()
@@ -378,6 +436,7 @@ def visual_quality_score(visual_json):
 @app.post("/tools/detect_visuals")
 async def detect_visuals(data: dict):
     file_id = data.get("file_id")
+    run_id = data.get("run_id")
     if not file_id:
         return {"status": "error", "detail": "file_id required"}
 
@@ -486,27 +545,26 @@ NO markdown.
 NO comments.
 NO explanations.
 
+Schema (do NOT copy as output):
 {
   "elements": [
     {
       "id": "e1",
-      "type": "shape",
-      "text": "Start",
-      "shape": "oval",
-      "bbox": [120, 80, 140, 60]
-    },
-    {
-      "id": "e2",
-      "type": "arrow",
-      "text": "",
-      "shape": "unknown",
-      "bbox": [180, 120, 40, 60],
-      "tail": [200, 120],
-      "head": [200, 180],
-      "label": "Yes"
+      "type": "shape|text|arrow",
+      "text": "<visible text or empty string>",
+      "shape": "<shape name or unknown>",
+      "bbox": [x, y, w, h],
+      "tail": [x, y],   // arrows only
+      "head": [x, y],   // arrows only
+      "label": "<Yes/No or empty>" // arrows only
     }
   ]
 }
+
+CRITICAL:
+- NEVER output the schema above.
+- NEVER use placeholder labels like "Start/Process/Decision/End" unless they appear in the image.
+- If text is unclear, set text="".
 
 ============================
 FINAL REQUIREMENT
@@ -606,15 +664,21 @@ Do NOT stop early.
                 best = cand
                 best_score = score
 
-    # After getting best result, apply repairs
+    # After getting best result, apply optional repairs
     visual_json = best
-    
-    # Repair missing shapes
-    visual_json = repair_missing_elements(visual_json, expected_min_shapes=6)
-    
-    # Repair missing arrows
-    visual_json = add_missing_arrows(visual_json)
-    
+
+    repair_mode = (data.get("repair_mode") or "conservative").lower()
+    shapes_now = [e for e in visual_json.get("elements", []) if e.get("type") == "shape"]
+    arrows_now = [e for e in visual_json.get("elements", []) if e.get("type") == "arrow"]
+
+    if repair_mode == "aggressive":
+        visual_json = repair_missing_elements(visual_json, expected_min_shapes=6)
+        visual_json = add_missing_arrows(visual_json)
+    elif repair_mode == "auto":
+        # Only add arrows when none are detected; keep shapes untouched
+        if len(arrows_now) == 0 and len(shapes_now) >= 2:
+            visual_json = add_missing_arrows(visual_json)
+
     # Final stats
     final_shapes = [e for e in visual_json.get("elements", []) if e.get("type") == "shape"]
     final_arrows = [e for e in visual_json.get("elements", []) if e.get("type") == "arrow"]
@@ -626,7 +690,8 @@ Do NOT stop early.
             "shapes_detected": len(final_shapes),
             "arrows_detected": len(final_arrows),
             "shape_texts": [s.get("text") for s in final_shapes],
-            "repairs_applied": True
+            "repairs_applied": repair_mode != "conservative",
+            "visual_json_path": _save_debug_json(run_id, "visual", visual_json),
         }
     }
 
@@ -862,6 +927,7 @@ def add_missing_arrows(visual_json: dict) -> dict:
 @app.post("/tools/reason_semantics")
 async def reason_semantics(data: dict):
     visual_json = data.get("visual_json")
+    run_id = data.get("run_id")
     if not visual_json:
         return {"status": "error", "detail": "visual_json required"}
 
@@ -902,6 +968,7 @@ async def reason_semantics(data: dict):
                 "raw_semantic": semantic_json,
             }
         
+        _save_debug_json(run_id, "semantic", semantic_json)
         return {"status": "ok", "semantic_json": semantic_json}
     
     # Fallback: not enough arrows detected, infer from positions
@@ -994,6 +1061,7 @@ async def reason_semantics(data: dict):
     
     print(f"Final semantic: {len(semantic_json['nodes'])} nodes, {len(semantic_json['edges'])} edges")
     
+    _save_debug_json(run_id, "semantic", semantic_json)
     return {"status": "ok", "semantic_json": semantic_json}
     
 #     prompt = """
@@ -1257,6 +1325,34 @@ def map_role_to_shape(role: str):
         "connector": MSO_AUTO_SHAPE_TYPE.FLOWCHART_CONNECTOR,
     }.get(role, MSO_AUTO_SHAPE_TYPE.RECTANGLE)
 
+def _connector_points(src, dst):
+    src_cx = src.left + src.width / 2
+    src_cy = src.top + src.height / 2
+    dst_cx = dst.left + dst.width / 2
+    dst_cy = dst.top + dst.height / 2
+
+    dx = dst_cx - src_cx
+    dy = dst_cy - src_cy
+
+    if abs(dx) >= abs(dy):
+        # left/right connection
+        if dx >= 0:
+            start = (src.left + src.width, src_cy)
+            end = (dst.left, dst_cy)
+        else:
+            start = (src.left, src_cy)
+            end = (dst.left + dst.width, dst_cy)
+    else:
+        # top/bottom connection
+        if dy >= 0:
+            start = (src_cx, src.top + src.height)
+            end = (dst_cx, dst.top)
+        else:
+            start = (src_cx, src.top)
+            end = (dst_cx, dst.top + dst.height)
+
+    return int(start[0]), int(start[1]), int(end[0]), int(end[1])
+
 @app.post("/tools/render_ppt")
 async def render_ppt(data: dict):
     semantic = data.get("semantic_json")
@@ -1308,16 +1404,35 @@ async def render_ppt(data: dict):
         if not src or not dst:
             continue
 
+        x1, y1, x2, y2 = _connector_points(src, dst)
         connector = slide.shapes.add_connector(
             MSO_CONNECTOR_TYPE.STRAIGHT,
-            int(src.left + src.width),
-            int(src.top + src.height / 2),
-            dst.left,
-            int(dst.top + dst.height / 2),
+            x1,
+            y1,
+            x2,
+            y2,
         )
 
         connector.line.width = Pt(1.5)
-        connector.line.end_arrowhead = True
+        connector.line.end_arrowhead_style = 2  # Arrow
+        
+        # Add edge label if present (Yes/No)
+        label = edge.get("label", "").strip()
+        if label:
+            # Position label near the connector midpoint
+            label_x = (x1 + x2) / 2
+            label_y = (y1 + y2) / 2
+            label_box = slide.shapes.add_textbox(
+                int(label_x - Inches(0.3)),
+                int(label_y - Inches(0.15)),
+                Inches(0.6),
+                Inches(0.3),
+            )
+            label_tf = label_box.text_frame
+            label_tf.text = label
+            label_tf.paragraphs[0].font.size = Pt(10)
+            label_tf.paragraphs[0].font.bold = True
+            label_tf.paragraphs[0].alignment = PP_ALIGN.CENTER
 
 
 
@@ -1383,11 +1498,15 @@ async def render_ppt(data: dict):
 
 @app.post("/tools/whiteboard_to_ppt")
 async def whiteboard_to_ppt(data: dict):
-    visuals = await detect_visuals(data)
+    run_id = data.get("run_id") or uuid.uuid4().hex
+    visuals = await detect_visuals({**data, "run_id": run_id})
     if visuals["status"] != "ok":
         return visuals
 
-    semantics = await reason_semantics({"visual_json": visuals["visual_json"]})
+    semantics = await reason_semantics({
+        "visual_json": visuals["visual_json"],
+        "run_id": run_id,
+    })
     if semantics["status"] != "ok":
         return semantics
 
@@ -1399,4 +1518,7 @@ async def whiteboard_to_ppt(data: dict):
         "status": "ok",
         "ppt_file": ppt["ppt_file"],
         "semantic_json": semantics["semantic_json"],
+        "run_id": run_id,
+        "visual_json_path": visuals.get("debug", {}).get("visual_json_path"),
+        "semantic_json_path": _save_debug_json(run_id, "semantic", semantics["semantic_json"]),
     }
